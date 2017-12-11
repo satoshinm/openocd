@@ -55,7 +55,7 @@ static int buspirate_swd_switch_seq(enum swd_special_seq seq);
 #define CMD_UART_SPEED    0x07
 #define CMD_JTAG_SPEED    0x08
 #define CMD_RAW_SPEED     0x60
-#define CMD_RAW_CONFIG    0x80
+#define CMD_RAW_CONFIG    0x80u
 #define CMD_RAW_FEATURE   0x40
 
 /* raw-wire mode configuration */
