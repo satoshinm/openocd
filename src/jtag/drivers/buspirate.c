@@ -22,6 +22,7 @@
 #endif
 
 #include <jtag/interface.h>
+#include <jtag/swd.h>
 #include <jtag/commands.h>
 
 #include <termios.h>
@@ -41,6 +42,7 @@ static void buspirate_runtest(int num_cycles);
 static void buspirate_scan(bool ir_scan, enum scan_type type,
 	uint8_t *buffer, int scan_size, struct scan_command *command);
 static void buspirate_stableclocks(int num_cycles);
+static int buspirate_swd_switch_seq(enum swd_special_seq seq);
 
 #define CMD_UNKNOWN       0x00
 #define CMD_PORT_MODE     0x01
@@ -48,9 +50,21 @@ static void buspirate_stableclocks(int num_cycles);
 #define CMD_READ_ADCS     0x03
 /*#define CMD_TAP_SHIFT     0x04 // old protocol */
 #define CMD_TAP_SHIFT     0x05
+#define CMD_ENTER_RWIRE   0x05
 #define CMD_ENTER_OOCD    0x06
 #define CMD_UART_SPEED    0x07
 #define CMD_JTAG_SPEED    0x08
+#define CMD_RAW_SPEED     0x60
+#define CMD_RAW_CONFIG    0x80
+#define CMD_RAW_FEATURE   0x40
+
+/* raw-wire mode configuration */
+#define CMD_RAW_CONFIG_HIZ 0x00
+#define CMD_RAW_CONFIG_3V3 0x08
+#define CMD_RAW_CONFIG_2W  0x00
+#define CMD_RAW_CONFIG_3W  0x04
+#define CMD_RAW_CONFIG_MSB 0x00
+#define CMD_RAW_CONFIG_LSB 0x02
 
 /* Not all OSes have this speed defined */
 #if !defined(B1000000)
@@ -64,22 +78,54 @@ enum {
 };
 
 enum {
-	FEATURE_LED = 0x01,
-	FEATURE_VREG = 0x02,
-	FEATURE_TRST = 0x04,
-	FEATURE_SRST = 0x08,
+	FEATURE_LED    = 0x01,
+	FEATURE_VREG   = 0x02,
+	FEATURE_TRST   = 0x04,
+	FEATURE_SRST   = 0x08,
 	FEATURE_PULLUP = 0x10
+};
+
+/* feature codes available in SWD mode */
+enum {
+	SWD_FEATURE_VREG   = 0x08,
+	SWD_FEATURE_PULLUP = 0x04,
+	SWD_FEATURE_SRST   = 0x02
 };
 
 enum {
 	ACTION_DISABLE = 0,
-	ACTION_ENABLE = 1
+	ACTION_ENABLE  = 1
 };
 
 enum {
 	SERIAL_NORMAL = 0,
-	SERIAL_FAST = 1
+	SERIAL_FAST   = 1
 };
+
+enum {
+	SPEED_RAW_5_KHZ   = 0x0,
+	SPEED_RAW_50_KHZ  = 0x1,
+	SPEED_RAW_100_KHZ = 0x2,
+	SPEED_RAW_400_KHZ = 0x3
+};
+
+static uint8_t swd_feature_config;
+
+/* SWD mode specific */
+static bool swd_mode;
+
+/* FIXME: Where to store per-instance data? We need an SWD context. */
+/*        copied from ftdi.c driver */
+static struct swd_cmd_queue_entry {
+	uint8_t cmd;
+	uint32_t *dst;
+	uint32_t data;
+	uint8_t parity;
+	uint8_t ack;
+} *swd_cmd_queue;
+static size_t swd_cmd_queue_length;
+static size_t swd_cmd_queue_alloced;
+static int    queued_retval;
 
 static const cc_t SHORT_TIMEOUT  = 1; /* Must be at least 1. */
 static const cc_t NORMAL_TIMEOUT = 10;
@@ -93,6 +139,8 @@ static char *buspirate_port;
 
 static enum tap_state last_tap_state = TAP_RESET;
 
+/* SWD interface */
+static int buspirate_swd_run_queue(void);
 
 /* TAP interface */
 static void buspirate_tap_init(void);
@@ -105,13 +153,17 @@ static void buspirate_tap_make_space(int scan, int bits);
 static void buspirate_reset(int trst, int srst);
 
 /* low level interface */
+static void buspirate_bbio_enable(int);
 static void buspirate_jtag_reset(int);
-static void buspirate_jtag_enable(int);
 static unsigned char buspirate_jtag_command(int, char *, int);
 static void buspirate_jtag_set_speed(int, char);
 static void buspirate_jtag_set_mode(int, char);
 static void buspirate_jtag_set_feature(int, char, char);
 static void buspirate_jtag_get_adcs(int);
+
+/* low level two-wire interface */
+static void buspirate_swd_set_params(int);
+static void buspirate_swd_set_feature(int, char, char);
 
 /* low level HW communication interface */
 static int buspirate_serial_open(char *port);
@@ -295,15 +347,20 @@ static int buspirate_init(void)
 		return ERROR_JTAG_INIT_FAILED;
 	}
 
-	buspirate_jtag_enable(buspirate_fd);
+	buspirate_bbio_enable(buspirate_fd);
 
-	if (buspirate_baudrate != SERIAL_NORMAL)
+	if (swd_mode)
+		buspirate_swd_set_params(buspirate_fd);
+	else if (buspirate_baudrate != SERIAL_NORMAL)
 		buspirate_jtag_set_speed(buspirate_fd, SERIAL_FAST);
 
-	LOG_INFO("Buspirate Interface ready!");
+	LOG_INFO("Buspirate %s Interface ready!", swd_mode ? "SWD" : "JTAG");
 
-	buspirate_tap_init();
-	buspirate_jtag_set_mode(buspirate_fd, buspirate_pinmode);
+	if (!swd_mode) {
+		buspirate_tap_init();
+		buspirate_jtag_set_mode(buspirate_fd, buspirate_pinmode);
+	}
+
 	buspirate_jtag_set_feature(buspirate_fd, FEATURE_VREG,
 		(buspirate_vreg == 1) ? ACTION_ENABLE : ACTION_DISABLE);
 	buspirate_jtag_set_feature(buspirate_fd, FEATURE_PULLUP,
@@ -316,9 +373,11 @@ static int buspirate_init(void)
 static int buspirate_quit(void)
 {
 	LOG_INFO("Shutting down buspirate.");
-	buspirate_jtag_set_mode(buspirate_fd, MODE_HIZ);
+	if (!swd_mode) {
+		buspirate_jtag_set_mode(buspirate_fd, MODE_HIZ);
+		buspirate_jtag_set_speed(buspirate_fd, SERIAL_NORMAL);
+	}
 
-	buspirate_jtag_set_speed(buspirate_fd, SERIAL_NORMAL);
 	buspirate_jtag_reset(buspirate_fd);
 
 	buspirate_serial_close(buspirate_fd);
@@ -327,6 +386,10 @@ static int buspirate_quit(void)
 		free(buspirate_port);
 		buspirate_port = NULL;
 	}
+
+	if (NULL != swd_cmd_queue)
+		free(swd_cmd_queue);
+
 	return ERROR_OK;
 }
 
@@ -440,6 +503,7 @@ COMMAND_HANDLER(buspirate_handle_port_command)
 
 }
 
+/* all commands except buspirate_port won't work in SWD mode */
 static const struct command_registration buspirate_command_handlers[] = {
 	{
 		.name = "buspirate_adc",
@@ -492,10 +556,240 @@ static const struct command_registration buspirate_command_handlers[] = {
 	COMMAND_REGISTRATION_DONE
 };
 
+static int buspirate_swd_init(void)
+{
+	LOG_INFO("Buspirate SWD mode enabled");
+	swd_mode = true;
+
+	swd_cmd_queue_alloced = 10;
+	swd_cmd_queue = malloc(swd_cmd_queue_alloced * sizeof(*swd_cmd_queue));
+
+	return swd_cmd_queue != NULL ? ERROR_OK : ERROR_FAIL;
+}
+
+static int buspirate_swd_switch_seq(enum swd_special_seq seq)
+{
+	const uint8_t *sequence;
+	int sequence_len;
+	char tmp[64];
+
+	switch (seq) {
+	case LINE_RESET:
+		LOG_DEBUG("SWD line reset");
+		sequence = swd_seq_line_reset;
+		sequence_len = DIV_ROUND_UP(swd_seq_line_reset_len, 8);
+		break;
+	case JTAG_TO_SWD:
+		LOG_DEBUG("JTAG-to-SWD");
+		sequence = swd_seq_jtag_to_swd;
+		sequence_len = DIV_ROUND_UP(swd_seq_jtag_to_swd_len, 8);
+		break;
+	case SWD_TO_JTAG:
+		LOG_DEBUG("SWD-to-JTAG");
+		sequence = swd_seq_swd_to_jtag;
+		sequence_len = DIV_ROUND_UP(swd_seq_swd_to_jtag_len, 8);
+		break;
+	default:
+		LOG_ERROR("Sequence %d not supported", seq);
+		return ERROR_FAIL;
+	}
+
+	/* FIXME: all above sequences fit into one pirate command for now
+	 *        but it may cause trouble later
+	 */
+
+	tmp[0] = 0x10 + ((sequence_len - 1) & 0x0F);
+	memcpy(tmp + 1, sequence, sequence_len);
+
+	buspirate_serial_write(buspirate_fd, tmp, sequence_len + 1);
+	buspirate_serial_read(buspirate_fd, tmp, sequence_len + 1);
+
+	return ERROR_OK;
+}
+
+static void buspirate_swd_queue_cmd(uint8_t cmd, uint32_t *dst, uint32_t data, uint32_t ap_delay_clk)
+{
+	if (swd_cmd_queue_length >= swd_cmd_queue_alloced) {
+		/* Not enough room in the queue. Run the queue and increase its size for next time.
+		 * Note that it's not possible to avoid running the queue here, because mpsse contains
+		 * pointers into the queue which may be invalid after the realloc. */
+		queued_retval = buspirate_swd_run_queue();
+		struct swd_cmd_queue_entry *q = realloc(swd_cmd_queue, swd_cmd_queue_alloced * 2 * sizeof(*swd_cmd_queue));
+		if (q != NULL) {
+			swd_cmd_queue = q;
+			swd_cmd_queue_alloced *= 2;
+			LOG_DEBUG("Increased SWD command queue to %zu elements", swd_cmd_queue_alloced);
+		}
+	}
+
+	if (queued_retval != ERROR_OK)
+		return;
+
+	size_t i = swd_cmd_queue_length++;
+	swd_cmd_queue[i].cmd = cmd | SWD_CMD_START | SWD_CMD_PARK;
+
+	if (swd_cmd_queue[i].cmd & SWD_CMD_RnW) {
+		/* Queue a read transaction */
+		swd_cmd_queue[i].dst = dst;
+	} else {
+		/* Queue a write transaction */
+		swd_cmd_queue[i].data = data;
+		swd_cmd_queue[i].parity = parity_u32(data) ? 0x01 : 0x00;
+	}
+}
+
+static void buspirate_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
+{
+	assert(cmd & SWD_CMD_RnW);
+	buspirate_swd_queue_cmd(cmd, value, 0, ap_delay_clk);
+}
+
+static void buspirate_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
+{
+	assert(!(cmd & SWD_CMD_RnW));
+	buspirate_swd_queue_cmd(cmd, NULL, value, ap_delay_clk);
+}
+
+static void buspirate_swd_idle_bytes(uint8_t count)
+{
+	char tmp[20];
+
+	tmp[0] = 0x10 + ((count - 1) & 0x0F);
+	memset(tmp + 1, 0x00, sizeof(tmp) - 1);
+
+	buspirate_serial_write(buspirate_fd, tmp, count + 1);
+	buspirate_serial_read(buspirate_fd, tmp, count + 1);
+}
+
+static int buspirate_run_cmd(size_t queue_item)
+{
+	char tmp[16];
+	int  to_send;
+
+	tmp[0] = 0x10; /* bus pirate: send 1 byte */
+	tmp[1] = swd_cmd_queue[queue_item].cmd; /* swd cmd */
+	tmp[2] = 0x07; /* ack __x */
+	tmp[3] = 0x07; /* ack _x_ */
+	tmp[4] = 0x07; /* ack x__ */
+	tmp[5] = 0x07; /* write mode trn_1 */
+	tmp[6] = 0x07; /* write mode trn_2 */
+
+	to_send = (((swd_cmd_queue[queue_item].cmd & SWD_CMD_RnW) == 0) ? 7 : 5);
+	buspirate_serial_write(buspirate_fd, tmp, to_send);
+
+	/* read ack */
+	buspirate_serial_read(buspirate_fd, tmp, 2); /* drop pirate command ret vals */
+	buspirate_serial_read(buspirate_fd, tmp, to_send - 2); /* ack bits */
+
+	swd_cmd_queue[queue_item].ack = tmp[2] << 2 | tmp[1] << 1 | tmp[0];
+
+	if (swd_cmd_queue[queue_item].cmd & SWD_CMD_RnW) {
+		/* do a read transaction */
+		tmp[0] = 0x06; /* 4 data bytes */
+		tmp[1] = 0x06;
+		tmp[2] = 0x06;
+		tmp[3] = 0x06;
+		tmp[4] = 0x07; /* parity bit */
+		tmp[5] = 0x21; /* 2 turnaround clocks */
+
+		buspirate_serial_write(buspirate_fd, tmp, 6);
+		buspirate_serial_read(buspirate_fd, tmp, 6);
+
+		/* store the data and parity */
+		swd_cmd_queue[queue_item].data = (uint8_t) tmp[0];
+		swd_cmd_queue[queue_item].data |= (uint8_t) tmp[1] << 8;
+		swd_cmd_queue[queue_item].data |= (uint8_t) tmp[2] << 16;
+		swd_cmd_queue[queue_item].data |= (uint8_t) tmp[3] << 24;
+		swd_cmd_queue[queue_item].parity = tmp[4] ? 0x01 : 0x00;
+	} else {
+		/* do a write transaction */
+		tmp[0] = 0x10 + ((4 + 1 - 1) & 0xF); /* bus pirate: send 4+1 bytes */
+		buf_set_u32((uint8_t *) tmp + 1, 0, 32, swd_cmd_queue[queue_item].data);
+		/* write sequence ends with parity bit and 7 idle ticks */
+		tmp[5] = swd_cmd_queue[queue_item].parity;
+
+		buspirate_serial_write(buspirate_fd, tmp, 6);
+		buspirate_serial_read(buspirate_fd, tmp, 6);
+	}
+
+	/* Insert idle cycles after AP accesses to avoid WAIT */
+	if (swd_cmd_queue[queue_item].cmd & SWD_CMD_APnDP)
+		buspirate_swd_idle_bytes(1);
+
+	return 0;
+}
+
+static int buspirate_swd_run_queue(void)
+{
+	LOG_DEBUG("Executing %zu queued transactions", swd_cmd_queue_length);
+	int retval;
+
+	if (queued_retval != ERROR_OK) {
+		LOG_DEBUG("Skipping due to previous errors: %d", queued_retval);
+		goto skip;
+	}
+
+	/* A transaction must be followed by another transaction or at least 8 idle cycles to
+	 * ensure that data is clocked through the AP. */
+	buspirate_swd_idle_bytes(1);
+
+	for (size_t i = 0; i < swd_cmd_queue_length; i++)
+		buspirate_run_cmd(i);
+
+	for (size_t i = 0; i < swd_cmd_queue_length; i++) {
+		int ack = swd_cmd_queue[i].ack;
+
+		LOG_DEBUG("%s %s %s reg %X = %08"PRIx32,
+				ack == SWD_ACK_OK ? "OK" : ack == SWD_ACK_WAIT ? "WAIT" : ack == SWD_ACK_FAULT ? "FAULT" : "JUNK",
+				swd_cmd_queue[i].cmd & SWD_CMD_APnDP ? "AP" : "DP",
+				swd_cmd_queue[i].cmd & SWD_CMD_RnW ? "read" : "write",
+				(swd_cmd_queue[i].cmd & SWD_CMD_A32) >> 1,
+				swd_cmd_queue[i].data);
+
+		if (ack != SWD_ACK_OK) {
+			queued_retval = ack == SWD_ACK_WAIT ? ERROR_WAIT : ERROR_FAIL;
+			goto skip;
+
+		} else if (swd_cmd_queue[i].cmd & SWD_CMD_RnW) {
+			uint32_t data = swd_cmd_queue[i].data;
+			int parity = swd_cmd_queue[i].parity;
+
+			if (parity != parity_u32(data)) {
+				LOG_ERROR("SWD Read data parity mismatch %x %x", parity, parity_u32(data));
+				queued_retval = ERROR_FAIL;
+				goto skip;
+			}
+
+			if (swd_cmd_queue[i].dst != NULL)
+				*swd_cmd_queue[i].dst = data;
+		}
+	}
+
+skip:
+	swd_cmd_queue_length = 0;
+	retval = queued_retval;
+	queued_retval = ERROR_OK;
+
+	return retval;
+}
+
+static const struct swd_driver buspirate_swd = {
+	.init = buspirate_swd_init,
+	.switch_seq = buspirate_swd_switch_seq,
+	.read_reg = buspirate_swd_read_reg,
+	.write_reg = buspirate_swd_write_reg,
+	.run = buspirate_swd_run_queue,
+};
+
+static const char * const buspirate_transports[] = { "jtag", "swd", NULL };
+
 struct jtag_interface buspirate_interface = {
 	.name = "buspirate",
 	.execute_queue = buspirate_execute_queue,
 	.commands = buspirate_command_handlers,
+	.transports = buspirate_transports,
+	.swd = &buspirate_swd,
+
 	.init = buspirate_init,
 	.quit = buspirate_quit
 };
@@ -806,12 +1100,15 @@ static void buspirate_reset(int trst, int srst)
 {
 	LOG_DEBUG("trst: %i, srst: %i", trst, srst);
 
-	if (trst)
-		buspirate_jtag_set_feature(buspirate_fd,
-				FEATURE_TRST, ACTION_DISABLE);
-	else
-		buspirate_jtag_set_feature(buspirate_fd,
-				FEATURE_TRST, ACTION_ENABLE);
+	/* trst is not available in SWD mode */
+	if (!swd_mode) {
+		if (trst)
+			buspirate_jtag_set_feature(buspirate_fd,
+					FEATURE_TRST, ACTION_DISABLE);
+		else
+			buspirate_jtag_set_feature(buspirate_fd,
+					FEATURE_TRST, ACTION_ENABLE);
+	}
 
 	if (srst)
 		buspirate_jtag_set_feature(buspirate_fd,
@@ -822,18 +1119,29 @@ static void buspirate_reset(int trst, int srst)
 }
 
 /*************** jtag lowlevel functions ********************/
-static void buspirate_jtag_enable(int fd)
+static void buspirate_bbio_enable(int fd)
 {
 	int ret;
+	char command;
+	const char *mode_answers[2] = { "OCD1", "RAW1" };
+	const char *correct_ans     = NULL;
 	char tmp[21] = { [0 ... 20] = 0x00 };
 	int done = 0;
 	int cmd_sent = 0;
 
-	LOG_DEBUG("Entering binary mode");
+	if (swd_mode) {
+		command     = CMD_ENTER_RWIRE;
+		correct_ans = mode_answers[1];
+	} else {
+		command     = CMD_ENTER_OOCD;
+		correct_ans = mode_answers[0];
+	}
+
+	LOG_DEBUG("Entering binary mode, that is %s", correct_ans);
 	buspirate_serial_write(fd, tmp, 20);
 	usleep(10000);
 
-	/* reads 1 to n "BBIO1"s and one "OCD1" */
+	/* reads 1 to n "BBIO1"s and one "OCD1" or "RAW1" */
 	while (!done) {
 		ret = buspirate_serial_read(fd, tmp, 4);
 		if (ret != 4) {
@@ -854,14 +1162,14 @@ static void buspirate_jtag_enable(int fd)
 			}
 			if (cmd_sent == 0) {
 				cmd_sent = 1;
-				tmp[0] = CMD_ENTER_OOCD;
+				tmp[0] = command;
 				ret = buspirate_serial_write(fd, tmp, 1);
 				if (ret != 1) {
 					LOG_ERROR("error reading");
 					exit(-1);
 				}
 			}
-		} else if (strncmp(tmp, "OCD1", 4) == 0)
+		} else if (strncmp(tmp, correct_ans, 4) == 0)
 			done = 1;
 		else {
 			LOG_ERROR("Buspirate did not answer correctly! "
@@ -876,7 +1184,7 @@ static void buspirate_jtag_reset(int fd)
 {
 	char tmp[5];
 
-	tmp[0] = 0x00; /* exit OCD1 mode */
+	tmp[0] = 0x00; /* exit binary mode */
 	buspirate_serial_write(fd, tmp, 1);
 	usleep(10000);
 	/* We ignore the return value here purposly, nothing we can do */
@@ -886,6 +1194,104 @@ static void buspirate_jtag_reset(int fd)
 		buspirate_serial_write(fd, tmp, 1);
 	} else
 		LOG_ERROR("Unable to restart buspirate!");
+}
+
+static void buspirate_swd_set_params(int fd)
+{
+	int  ret;
+	char tmp[1];
+
+	/* raw-wire mode configuration */
+	tmp[0] = CMD_RAW_CONFIG | CMD_RAW_CONFIG_3V3 | CMD_RAW_CONFIG_LSB;
+	buspirate_serial_write(fd, tmp, 1);
+	ret = buspirate_serial_read(fd, tmp, 1);
+	if (ret != 1) {
+		LOG_ERROR("Buspirate did not answer correctly");
+		exit(-1);
+	}
+	if (tmp[0] != 1) {
+		LOG_ERROR("Buspirate did not reply as expected to the configure command");
+		exit(-1);
+	}
+
+	/* speed settings */
+	tmp[0] = CMD_RAW_SPEED | SPEED_RAW_400_KHZ;
+	buspirate_serial_write(fd, tmp, 1);
+	ret = buspirate_serial_read(fd, tmp, 1);
+	if (ret != 1) {
+		LOG_ERROR("Buspirate did not answer correctly");
+		exit(-1);
+	}
+	if (tmp[0] != 1) {
+		LOG_ERROR("Buspirate did not reply as expected to the speed change command");
+		exit(-1);
+	}
+	LOG_INFO("Buspirate two-wire mode configured correctly");
+}
+
+static char *buspirate_feature_to_txt(char feat)
+{
+	/* simple enum to human-readable text converter */
+	switch (feat) {
+	case FEATURE_LED:
+		return "buspirate_led";
+	case FEATURE_SRST:
+		return "SRST";
+	case FEATURE_TRST:
+		return "TRST";
+	case FEATURE_VREG:
+		return "buspirate_vreg";
+	case FEATURE_PULLUP:
+		return "buspirate_pullup";
+	default:
+		return "<unrecognized>";
+	}
+}
+
+static void buspirate_swd_set_feature(int fd, char feat, char action)
+{
+	uint8_t new_config;
+	bool f_enable = (action == ACTION_ENABLE) ? true : false;
+	char tmp[1];
+
+	new_config = swd_feature_config;
+
+	switch (feat) {
+	case FEATURE_VREG:
+		if (f_enable)
+			new_config |= SWD_FEATURE_VREG;
+		else
+			new_config &= ~SWD_FEATURE_VREG;
+		break;
+	case FEATURE_SRST:
+		if (f_enable)
+			new_config |= SWD_FEATURE_SRST;
+		else
+			new_config &= ~SWD_FEATURE_SRST;
+		break;
+	case FEATURE_PULLUP:
+		if (f_enable)
+			new_config |= SWD_FEATURE_PULLUP;
+		else
+			new_config &= ~SWD_FEATURE_PULLUP;
+		break;
+	default:
+		LOG_ERROR("Buspirate feature %s is not available in SWD mode",
+				buspirate_feature_to_txt(feat));
+		return;
+	}
+
+	tmp[0] = CMD_RAW_FEATURE | new_config;
+	buspirate_serial_write(fd, tmp, 1);
+	buspirate_serial_read(fd, tmp, 1);
+
+	if (0x01 != tmp[0]) {
+		LOG_ERROR("Buspirate was unable to set feature %s",
+				buspirate_feature_to_txt(feat));
+		return;
+	}
+
+	swd_feature_config = new_config;
 }
 
 static void buspirate_jtag_set_speed(int fd, char speed)
@@ -933,6 +1339,12 @@ static void buspirate_jtag_set_mode(int fd, char mode)
 static void buspirate_jtag_set_feature(int fd, char feat, char action)
 {
 	char tmp[3];
+
+	if (swd_mode) {
+		buspirate_swd_set_feature(fd, feat, action);
+		return;
+	}
+
 	tmp[0] = CMD_FEATURE;
 	tmp[1] = feat;   /* what */
 	tmp[2] = action; /* action */
