@@ -222,7 +222,6 @@ static int telnet_new_connection(struct connection *connection)
 	telnet_connection->closed = 0;
 	telnet_connection->line_size = 0;
 	telnet_connection->line_cursor = 0;
-	telnet_connection->option_size = 0;
 	telnet_connection->prompt = strdup("> ");
 	telnet_connection->state = TELNET_STATE_DATA;
 
@@ -573,7 +572,7 @@ static int telnet_input(struct connection *connection)
 				break;
 			default:
 				LOG_ERROR("unknown telnet state");
-				exit(-1);
+				return ERROR_FAIL;
 		}
 
 		bytes_read--;
@@ -624,9 +623,8 @@ int telnet_init(char *banner)
 		return ERROR_OK;
 	}
 
-	struct telnet_service *telnet_service;
-
-	telnet_service = malloc(sizeof(struct telnet_service));
+	struct telnet_service *telnet_service =
+		malloc(sizeof(struct telnet_service));
 
 	if (!telnet_service) {
 		LOG_ERROR("Failed to allocate telnet service.");
@@ -635,13 +633,16 @@ int telnet_init(char *banner)
 
 	telnet_service->banner = banner;
 
-	return add_service("telnet",
-		telnet_port,
-		CONNECTION_LIMIT_UNLIMITED,
-		telnet_new_connection,
-		telnet_input,
-		telnet_connection_closed,
+	int ret = add_service("telnet", telnet_port, CONNECTION_LIMIT_UNLIMITED,
+		telnet_new_connection, telnet_input, telnet_connection_closed,
 		telnet_service);
+
+	if (ret != ERROR_OK) {
+		free(telnet_service);
+		return ret;
+	}
+
+	return ERROR_OK;
 }
 
 /* daemon configuration command telnet_port */

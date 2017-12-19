@@ -50,11 +50,12 @@ static int64_t current_time;
 
 static int64_t start;
 
-static const char * const log_strings[5] = {
+static const char * const log_strings[6] = {
 	"User : ",
 	"Error: ",
 	"Warn : ",	/* want a space after each colon, all same width, colons aligned */
 	"Info : ",
+	"Debug: ",
 	"Debug: "
 };
 
@@ -103,7 +104,7 @@ static void log_forward(const char *file, unsigned line, const char *function, c
 	}
 }
 
-/* The log_puts() serves to somewhat different goals:
+/* The log_puts() serves two somewhat different goals:
  *
  * - logging
  * - feeding low-level info to the user in GDB or Telnet
@@ -191,6 +192,30 @@ void log_printf(enum log_levels level,
 	va_end(ap);
 }
 
+void log_vprintf_lf(enum log_levels level, const char *file, unsigned line,
+		const char *function, const char *format, va_list args)
+{
+	char *tmp;
+
+	count++;
+
+	if (level > debug_level)
+		return;
+
+	tmp = alloc_vprintf(format, args);
+
+	if (!tmp)
+		return;
+
+	/*
+	 * Note: alloc_vprintf() guarantees that the buffer is at least one
+	 * character longer.
+	 */
+	strcat(tmp, "\n");
+	log_puts(level, file, line, function, tmp);
+	free(tmp);
+}
+
 void log_printf_lf(enum log_levels level,
 	const char *file,
 	unsigned line,
@@ -198,23 +223,10 @@ void log_printf_lf(enum log_levels level,
 	const char *format,
 	...)
 {
-	char *string;
 	va_list ap;
 
-	count++;
-	if (level > debug_level)
-		return;
-
 	va_start(ap, format);
-
-	string = alloc_vprintf(format, ap);
-	if (string != NULL) {
-		strcat(string, "\n");	/* alloc_vprintf guaranteed the buffer to be at least one
-					 *char longer */
-		log_puts(level, file, line, function, string);
-		free(string);
-	}
-
+	log_vprintf_lf(level, file, line, function, format, ap);
 	va_end(ap);
 }
 
@@ -223,8 +235,8 @@ COMMAND_HANDLER(handle_debug_level_command)
 	if (CMD_ARGC == 1) {
 		int new_level;
 		COMMAND_PARSE_NUMBER(int, CMD_ARGV[0], new_level);
-		if ((new_level > LOG_LVL_DEBUG) || (new_level < LOG_LVL_SILENT)) {
-			LOG_ERROR("level must be between %d and %d", LOG_LVL_SILENT, LOG_LVL_DEBUG);
+		if ((new_level > LOG_LVL_DEBUG_IO) || (new_level < LOG_LVL_SILENT)) {
+			LOG_ERROR("level must be between %d and %d", LOG_LVL_SILENT, LOG_LVL_DEBUG_IO);
 			return ERROR_COMMAND_SYNTAX_ERROR;
 		}
 		debug_level = new_level;
@@ -240,9 +252,15 @@ COMMAND_HANDLER(handle_log_output_command)
 {
 	if (CMD_ARGC == 1) {
 		FILE *file = fopen(CMD_ARGV[0], "w");
-
-		if (file)
-			log_output = file;
+		if (file == NULL) {
+			LOG_ERROR("failed to open output log '%s'", CMD_ARGV[0]);
+			return ERROR_FAIL;
+		}
+		if (log_output != stderr && log_output != NULL) {
+			/* Close previous log file, if it was open and wasn't stderr. */
+			fclose(log_output);
+		}
+		log_output = file;
 	}
 
 	return ERROR_OK;
@@ -262,7 +280,8 @@ static struct command_registration log_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.help = "Sets the verbosity level of debugging output. "
 			"0 shows errors only; 1 adds warnings; "
-			"2 (default) adds other info; 3 adds debugging.",
+			"2 (default) adds other info; 3 adds debugging; "
+			"4 adds extra verbose debugging.",
 		.usage = "number",
 	},
 	COMMAND_REGISTRATION_DONE
@@ -286,7 +305,7 @@ void log_init(void)
 		int retval = parse_int(debug_env, &value);
 		if (ERROR_OK == retval &&
 				debug_level >= LOG_LVL_SILENT &&
-				debug_level <= LOG_LVL_DEBUG)
+				debug_level <= LOG_LVL_DEBUG_IO)
 				debug_level = value;
 	}
 
