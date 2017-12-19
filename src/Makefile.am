@@ -10,6 +10,8 @@ bin_PROGRAMS += %D%/openocd
 
 %C%_openocd_LDADD = %D%/libopenocd.la
 
+%C%_openocd_LDADD += -lpthread
+
 %C%_openocd_LDADD += $(MINGWLDADD)
 
 if INTERNAL_JIMTCL

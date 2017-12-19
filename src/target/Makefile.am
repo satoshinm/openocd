@@ -19,6 +19,8 @@ noinst_LTLIBRARIES += %D%/libtarget.la
 	$(AVR32_SRC) \
 	$(MIPS32_SRC) \
 	$(NDS32_SRC) \
+	$(ESP108_SRC) \
+	$(ESP32_SRC) \
 	$(STM8_SRC) \
 	$(INTEL_IA32_SRC) \
 	%D%/avrt.c \
@@ -128,6 +130,15 @@ NDS32_SRC = \
 STM8_SRC = \
 	%D%/stm8.c
 
+ESP108_SRC= \
+	%D%/esp108_common.c \
+	%D%/esp108.c \
+	%D%/esp108_apptrace.c
+
+ESP32_SRC= \
+	%D%/esp108_common.c \
+	%D%/esp32.c
+
 INTEL_IA32_SRC = \
 	%D%/quark_x10xx.c \
 	%D%/quark_d20xx.c \
@@ -213,5 +224,8 @@ INTEL_IA32_SRC = \
 	%D%/lakemont.h \
 	%D%/x86_32_common.h \
 	%D%/arm_cti.h
+	%D%/esp108_common.h \
+	%D%/esp108.h \
+	%D%/esp32.h
 
 include %D%/openrisc/Makefile.am

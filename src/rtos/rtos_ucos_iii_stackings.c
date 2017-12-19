@@ -50,5 +50,6 @@ const struct rtos_register_stacking rtos_uCOS_III_Cortex_M_stacking = {
 	-1,													/* stack_growth_direction */
 	ARRAY_SIZE(rtos_uCOS_III_Cortex_M_stack_offsets),	/* num_output_registers */
 	rtos_generic_stack_align8,							/* stack_alignment */
-	rtos_uCOS_III_Cortex_M_stack_offsets				/* register_offsets */
+	rtos_uCOS_III_Cortex_M_stack_offsets,				/* register_offsets */
+	NULL												/* custom_stack_read_fn */
 };

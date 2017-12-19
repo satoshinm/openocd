@@ -22,6 +22,7 @@
 
 #include "rtos.h"
 #include "target/target.h"
+#include "target/target_type.h"
 #include "helper/log.h"
 #include "helper/binarybuffer.h"
 #include "server/gdb_server.h"
@@ -413,6 +414,9 @@ int rtos_thread_packet(struct connection *connection, char const *packet, int pa
 				target->rtos->current_threadid = target->rtos->current_thread;
 			else
 				target->rtos->current_threadid = threadid;
+      if (target->rtos->type->set_current_thread != NULL) {
+				target->rtos->type->set_current_thread(target->rtos, target->rtos->current_threadid);
+			}
 		}
 		gdb_put_packet(connection, "OK", 2);
 		return ERROR_OK;
@@ -431,6 +435,11 @@ int rtos_get_gdb_reg_list(struct connection *connection)
 			(target->smp))) {	/* in smp several current thread are possible */
 		char *hex_reg_list;
 
+		for (int i = 0; i < target->type->get_cores_count(target); i++)	{
+			if (((int)current_threadid == target->rtos->core_running_threads[i])) {
+				return ERROR_FAIL;
+			}
+		}
 		LOG_DEBUG("RTOS: getting register list for thread 0x%" PRIx64
 				  ", target->rtos->current_thread=0x%" PRIx64 "\r\n",
 										current_threadid,
@@ -453,6 +462,7 @@ int rtos_get_gdb_reg_list(struct connection *connection)
 	return ERROR_FAIL;
 }
 
+
 int rtos_generic_stack_read(struct target *target,
 	const struct rtos_register_stacking *stacking,
 	int64_t stack_ptr,
@@ -472,9 +482,15 @@ int rtos_generic_stack_read(struct target *target,
 	uint8_t *stack_data = malloc(stacking->stack_registers_size);
 	uint32_t address = stack_ptr;
 
-	if (stacking->stack_growth_direction == 1)
-		address -= stacking->stack_registers_size;
-	retval = target_read_buffer(target, address, stacking->stack_registers_size, stack_data);
+	if (stacking->custom_stack_read_fn) {
+		retval = stacking->custom_stack_read_fn(target, stack_ptr, stacking, stack_data);
+	} else {
+		if (stacking->stack_growth_direction == 1)
+			address -= stacking->stack_registers_size;
+		retval = target_read_buffer(target, address, stacking->stack_registers_size, stack_data);
+	}
+
+	
 	if (retval != ERROR_OK) {
 		free(stack_data);
 		LOG_ERROR("Error reading stack frame from thread");
